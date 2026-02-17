@@ -27,6 +27,42 @@ jobs:
 
       - run: cargo bench
 
+      - name: Verify cachegrind emits required events
+        run: |
+          mkdir -p target/iai
+          IAI_BENCH="$(find target/release/deps -maxdepth 1 -type f -executable -name 'test_regular_bench-*' | head -n 1)"
+          if [ -z "$IAI_BENCH" ]; then
+            echo "Unable to locate benchmark binary for cachegrind smoke test" >&2
+            exit 1
+          fi
+
+          valgrind --tool=cachegrind \
+            --cache-sim=yes \
+            --I1=32768,8,64 \
+            --D1=32768,8,64 \
+            --LL=8388608,16,64 \
+            --cachegrind-out-file=target/iai/ci-cachegrind.out \
+            "${IAI_BENCH}" --iai-run -1
+
+          events_line="$(grep '^events:' target/iai/ci-cachegrind.out | head -n 1 | sed 's/^events: //')"
+
+          if [ -z "$events_line" ]; then
+            echo "cachegrind output missing required events line" >&2
+            exit 1
+          fi
+
+          for event in Ir I1mr ILmr Dr D1mr DLmr Dw D1mw DLmw; do
+            printf '%s\n' "$events_line" | tr ' ' '\n' | grep -qx "$event" || {
+              echo "cachegrind output missing required event: $event" >&2
+              exit 1
+            }
+          done
+
+          if ! grep -q '^summary:' target/iai/ci-cachegrind.out; then
+            echo "cachegrind output missing summary line" >&2
+            exit 1
+          fi
+
       - if: ${{ matrix.rust == 'nightly' }}
         working-directory: ./macro
         run: cargo bench

@@ -17,11 +17,10 @@ proc-macro = true
 [dependencies]
 proc-macro2 = { version = "1.0", features = ["nightly"] }
 quote = "1.0"
+syn = { version = "2", features = ["full"] }
 
 [dev-dependencies]
 iai = { version = "0.1.1", path = "..", default-features = false, features = ["macro"] }
 
 [[bench]]
 name = "test_macro_bench"
-
-[workspace]

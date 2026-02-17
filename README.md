@@ -43,6 +43,11 @@ single-shot measurements of Rust code.
 In order to use Iai, you must have [Valgrind] installed. This means that Iai cannot be used on
 platforms that are not supported by Valgrind.
 
+Valgrind versions that default cache simulation to `--cache-sim=no` are supported because
+Iai passes `--cache-sim=yes` when running benchmarks. This ensures cachegrind output always
+includes cache hierarchy counters required by the parser (`Ir`, `I1mr`, `ILmr`, `Dr`, `D1mr`,
+`DLmr`, `Dw`, `D1mw`, `DLmw`).
+
 [Valgrind]: https://www.valgrind.org
 
 To start with Iai, add the following to your `Cargo.toml` file:
@@ -151,13 +156,7 @@ For more details, see the [CONTRIBUTING.md file](https://github.com/bheisler/iai
 
 ### Compatibility Policy
 
-Iai supports the last three stable minor releases of Rust. At time of
-writing, this means Rust 1.48 or later. Older versions may work, but are not tested or guaranteed.
-
-Currently, the oldest version of Rust believed to work is 1.48. Future versions of Iai may
-break support for versions older than 3-versions-ago, and this will not be considered a breaking change. If you
-require Iai to work on old versions of Rust, you will need to stick to a
-specific patch version of Iai.
+Iai is developed and tested against current stable Rust in CI. Older versions may work, but are not guaranteed.
 
 ### Maintenance
 
