@@ -1,6 +1,6 @@
-use std::{collections::HashMap, fmt, num::ParseIntError};
+use std::{collections::HashMap, fmt};
 
-const REQUIRED_CACHEGRIND_EVENTS: &[&str] = &[
+const REQUIRED_EVENTS: &[&str] = &[
     "Ir", "I1mr", "ILmr", "Dr", "D1mr", "DLmr", "Dw", "D1mw", "DLmw",
 ];
 
@@ -16,94 +16,53 @@ pub(crate) struct Invocation {
 /// The two invocation modes recognized by the runner.
 #[derive(Clone, Debug)]
 pub(crate) enum InvocationMode {
-    /// Spawned child invocation; runs only `benchmark_index` via `--iai-run`.
-    Child { benchmark_index: isize },
-    /// Primary harness invocation; drives calibration and all registered benches.
+    /// Spawned child invocation; runs all benchmarks under Callgrind collection.
+    Child,
+    /// Primary harness invocation; drives all registered benches.
     Parent,
-}
-
-/// Validation failures that can occur while parsing CLI arguments.
-#[derive(Debug)]
-pub(crate) enum InvocationParseError {
-    /// `--iai-run` was provided without a following index.
-    MissingBenchmarkIndex,
-    /// The provided index argument was present but not an integer.
-    InvalidBenchmarkIndex(ParseIntError),
 }
 
 /// Parse process arguments into an invocation descriptor.
 ///
 /// Expected shape:
 /// - No special flags => parent mode
-/// - `--iai-run <index>` => child mode with benchmark index dispatch
-/// - Any additional tokens after a child index are ignored by construction.
-pub(crate) fn parse_invocation<I>(mut args: I) -> Result<Invocation, InvocationParseError>
+/// - `--iai-run` => child mode (all benchmarks run under Callgrind)
+pub(crate) fn parse_invocation<I>(mut args: I) -> Invocation
 where
     I: Iterator<Item = String>,
 {
-    // Keep only explicit shape parsing here; all other users receive a fully typed
-    // invocation and no longer need to inspect argument arrays.
     let executable = args.next().unwrap_or_default();
 
     match args.next() {
-        Some(flag) if flag == "--iai-run" => {
-            let index = args
-                .next()
-                .ok_or(InvocationParseError::MissingBenchmarkIndex)?;
-            let benchmark_index = index
-                .parse::<isize>()
-                .map_err(InvocationParseError::InvalidBenchmarkIndex)?;
-
-            Ok(Invocation {
-                executable,
-                mode: InvocationMode::Child { benchmark_index },
-            })
-        }
-        _ => Ok(Invocation {
+        Some(flag) if flag == "--iai-run" => Invocation {
+            executable,
+            mode: InvocationMode::Child,
+        },
+        _ => Invocation {
             executable,
             mode: InvocationMode::Parent,
-        }),
-    }
-}
-
-impl fmt::Display for InvocationParseError {
-    /// Render parse errors as compact diagnostics consumed by harness error paths.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingBenchmarkIndex => {
-                write!(
-                    f,
-                    "Invalid --iai-run invocation: benchmark index is missing"
-                )
-            }
-            Self::InvalidBenchmarkIndex(error) => {
-                write!(
-                    f,
-                    "Invalid --iai-run invocation: benchmark index is invalid ({error})"
-                )
-            }
-        }
+        },
     }
 }
 
 impl fmt::Display for Invocation {
-    /// Display either `"<exe>"` or `"<exe> --iai-run <index>"`.
+    /// Display either `"<exe>"` or `"<exe> --iai-run"`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.mode {
             InvocationMode::Parent => write!(f, "{}", self.executable),
-            InvocationMode::Child { benchmark_index } => {
-                write!(f, "{} --iai-run {}", self.executable, benchmark_index)
+            InvocationMode::Child => {
+                write!(f, "{} --iai-run", self.executable)
             }
         }
     }
 }
 
-/// Cachegrind counters required by the parser and reporting pipeline.
+/// Callgrind counters required by the parser and reporting pipeline.
 ///
-/// The fields map directly to the events requested from cachegrind and are kept
+/// The fields map directly to the events requested from Callgrind and are kept
 /// as raw counters until report-time normalization.
 #[derive(Clone, Debug)]
-pub(crate) struct CachegrindStats {
+pub(crate) struct CallgrindStats {
     pub(crate) instruction_reads: u64,
     pub(crate) instruction_l1_misses: u64,
     pub(crate) instruction_cache_misses: u64,
@@ -115,23 +74,21 @@ pub(crate) struct CachegrindStats {
     pub(crate) data_cache_write_misses: u64,
 }
 
-impl CachegrindStats {
-    /// Build stats from parsed cachegrind event values.
+impl CallgrindStats {
+    /// Build stats from parsed Callgrind event values.
     ///
     /// Returns an error if any required event is missing.
     pub(crate) fn from_events(events: &HashMap<String, u64>) -> Result<Self, String> {
-        // Validate required counters up front so missing data fails early and
-        // before arithmetic starts.
         let event_value = |key: &str| {
             events
                 .get(key)
                 .copied()
-                .ok_or_else(|| format!("Missing required cachegrind event: {key}"))
+                .ok_or_else(|| format!("Missing required event: {key}"))
         };
 
-        for key in REQUIRED_CACHEGRIND_EVENTS {
+        for key in REQUIRED_EVENTS {
             if !events.contains_key(*key) {
-                return Err(format!("Missing required cachegrind event: {key}"));
+                return Err(format!("Missing required event: {key}"));
             }
         }
 
@@ -156,7 +113,7 @@ impl CachegrindStats {
     }
 
     /// Reduce raw counters into cache hierarchy groupings used by reports.
-    pub(crate) fn summarize(&self) -> CachegrindSummary {
+    pub(crate) fn summarize(&self) -> CallgrindSummary {
         let ram_hits = self.ram_accesses();
         let l3_accesses =
             self.instruction_l1_misses + self.data_l1_read_misses + self.data_l1_write_misses;
@@ -165,56 +122,24 @@ impl CachegrindStats {
         let total_memory_rw = self.instruction_reads + self.data_reads + self.data_writes;
         let l1_hits = total_memory_rw - (ram_hits + l3_hits);
 
-        CachegrindSummary {
+        CallgrindSummary {
             l1_hits,
             l3_hits,
             ram_hits,
-        }
-    }
-
-    /// Subtract calibration counters with saturating arithmetic.
-    ///
-    /// Saturating subtraction intentionally avoids panic/underflow if a future
-    /// counter format drifts below calibration values.
-    pub(crate) fn subtract(&self, calibration: &CachegrindStats) -> CachegrindStats {
-        CachegrindStats {
-            instruction_reads: self
-                .instruction_reads
-                .saturating_sub(calibration.instruction_reads),
-            instruction_l1_misses: self
-                .instruction_l1_misses
-                .saturating_sub(calibration.instruction_l1_misses),
-            instruction_cache_misses: self
-                .instruction_cache_misses
-                .saturating_sub(calibration.instruction_cache_misses),
-            data_reads: self.data_reads.saturating_sub(calibration.data_reads),
-            data_l1_read_misses: self
-                .data_l1_read_misses
-                .saturating_sub(calibration.data_l1_read_misses),
-            data_cache_read_misses: self
-                .data_cache_read_misses
-                .saturating_sub(calibration.data_cache_read_misses),
-            data_writes: self.data_writes.saturating_sub(calibration.data_writes),
-            data_l1_write_misses: self
-                .data_l1_write_misses
-                .saturating_sub(calibration.data_l1_write_misses),
-            data_cache_write_misses: self
-                .data_cache_write_misses
-                .saturating_sub(calibration.data_cache_write_misses),
         }
     }
 }
 
 /// Derived cache summary values used for presentation.
 #[derive(Clone, Debug)]
-pub(crate) struct CachegrindSummary {
+pub(crate) struct CallgrindSummary {
     pub(crate) l1_hits: u64,
     pub(crate) l3_hits: u64,
     pub(crate) ram_hits: u64,
 }
 
-impl CachegrindSummary {
-    /// Estimate weighted memory-hierarchy cycles using the Cachegrind weights.
+impl CallgrindSummary {
+    /// Estimate weighted memory-hierarchy cycles.
     ///
     /// The weighting intentionally follows a simple static model used by this
     /// project and is kept in one place to support later replacement.
@@ -244,8 +169,6 @@ pub(crate) fn percentage_diff(new: u64, old: u64) -> String {
 }
 
 fn signed_short(n: f64) -> String {
-    // Keep percentage strings compact and aligned while preserving sign.
-    // Reduce decimal precision as magnitude grows to keep terminal output compact.
     let n_abs = n.abs();
 
     if n_abs < 10.0 {
@@ -272,51 +195,18 @@ mod tests {
     #[test]
     fn parse_invocation_parent_mode_when_no_iai_flag() {
         let args = vec!["/path/to/test".to_owned(), "bench_a".to_owned()];
-        let invocation =
-            parse_invocation(args.into_iter()).expect("failed to parse parent invocation");
+        let invocation = parse_invocation(args.into_iter());
 
         assert_eq!(invocation.executable, "/path/to/test");
         assert!(matches!(invocation.mode, InvocationMode::Parent));
     }
 
     #[test]
-    fn parse_invocation_child_mode_extracts_index() {
-        let args = vec![
-            "/path/to/test".to_owned(),
-            "--iai-run".to_owned(),
-            "2".to_owned(),
-        ];
-        let invocation =
-            parse_invocation(args.into_iter()).expect("failed to parse child invocation");
-
-        assert!(matches!(
-            invocation.mode,
-            InvocationMode::Child { benchmark_index: 2 }
-        ));
-    }
-
-    #[test]
-    fn parse_invocation_rejects_missing_child_index() {
+    fn parse_invocation_child_mode() {
         let args = vec!["/path/to/test".to_owned(), "--iai-run".to_owned()];
+        let invocation = parse_invocation(args.into_iter());
 
-        assert!(matches!(
-            parse_invocation(args.into_iter()),
-            Err(InvocationParseError::MissingBenchmarkIndex)
-        ));
-    }
-
-    #[test]
-    fn parse_invocation_rejects_non_numeric_child_index() {
-        let args = vec![
-            "/path/to/test".to_owned(),
-            "--iai-run".to_owned(),
-            "not-a-number".to_owned(),
-        ];
-
-        assert!(matches!(
-            parse_invocation(args.into_iter()),
-            Err(InvocationParseError::InvalidBenchmarkIndex(_))
-        ));
+        assert!(matches!(invocation.mode, InvocationMode::Child));
     }
 
     #[test]
@@ -340,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn cachegrind_from_events_requires_all_metrics() {
+    fn callgrind_from_events_requires_all_metrics() {
         let events = vec![
             ("Ir".to_owned(), 1),
             ("I1mr".to_owned(), 2),
@@ -354,6 +244,6 @@ mod tests {
         .into_iter()
         .collect::<std::collections::HashMap<String, u64>>();
 
-        assert!(CachegrindStats::from_events(&events).is_err());
+        assert!(CallgrindStats::from_events(&events).is_err());
     }
 }

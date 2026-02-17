@@ -9,11 +9,14 @@ use std::{
 use crate::infrastructure::StandardSystem;
 use crate::{
     domain::{
-        CachegrindStats, CachegrindSummary, Invocation, InvocationMode, parse_invocation,
+        CallgrindStats, CallgrindSummary, Invocation, InvocationMode, parse_invocation,
         percentage_diff,
     },
     ports::System,
 };
+
+/// Per-benchmark stats keyed by name, for both current and baseline runs.
+type BenchStatsMap = HashMap<String, CallgrindStats>;
 
 /// Execute the benchmark harness.
 ///
@@ -32,33 +35,24 @@ pub(crate) fn runner(benches: &[&(&'static str, fn())]) {
 /// - typed argument parsing
 /// - invocation mode dispatch
 /// - child-process execution path
-/// - benchmark loop with calibration and baseline comparisons
+/// - benchmark loop with baseline comparisons
 fn run_with_system<I>(benches: &[&(&'static str, fn())], system: &impl System, args: I)
 where
     I: IntoIterator<Item = String>,
 {
-    // Parse the process invocation first so parent and child modes share a single
-    // validated entry point.
-    let Invocation { executable, mode } = match parse_invocation(args.into_iter()) {
-        Ok(invocation) => invocation,
-        Err(error) => {
-            eprintln!("{error}");
-            return;
-        }
-    };
+    let Invocation { executable, mode } = parse_invocation(args.into_iter());
 
     match mode {
-        InvocationMode::Child { benchmark_index } => {
-            // Child mode is intentionally single-shot: the selected benchmark is
-            // executed and this process then exits the runner loop.
-            run_child_benchmark(benches, benchmark_index);
+        InvocationMode::Child => {
+            // Child mode: execute all benchmarks sequentially under Callgrind collection.
+            run_child_benchmarks(benches);
             return;
         }
         InvocationMode::Parent => {}
     }
 
-    // Parent mode performs: valgrind validation, one calibration run, and then
-    // the full benchmark table (with baseline subtraction applied when present).
+    // Parent mode: validate Callgrind, run all benchmarks in a single invocation,
+    // and display reports with baseline comparisons when available.
     if !check_valgrind(system) {
         return;
     }
@@ -66,46 +60,29 @@ where
     let arch = get_arch();
     let allow_aslr = system.var_os("IAI_ALLOW_ASLR").is_some();
 
-    let (calibration, old_calibration) = match run_bench(
-        system,
-        &arch,
-        &executable,
-        -1,
-        "iai_calibration",
-        allow_aslr,
-    ) {
-        Ok((new_stats, old_stats)) => (new_stats, old_stats),
-        Err(error) => {
-            eprintln!("Failed to run calibration benchmark: {}", error);
-            return;
-        }
-    };
-
-    for (index, (name, _func)) in benches.iter().enumerate() {
-        let (stats, old_stats) =
-            match run_bench(system, &arch, &executable, index as isize, name, allow_aslr) {
-                Ok(result) => result,
-                Err(error) => {
-                    eprintln!("Failed to run benchmark '{}': {}", name, error);
-                    continue;
-                }
-            };
-
-        let stats = stats.subtract(&calibration);
-        let old_stats = match (&old_stats, &old_calibration) {
-            (Some(old_stats), Some(old_calibration)) => Some(old_stats.subtract(old_calibration)),
-            _ => None,
+    let (stats_map, old_stats_map) =
+        match run_benches(system, &arch, &executable, benches, allow_aslr) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("Failed to run benchmarks: {}", error);
+                return;
+            }
         };
 
-        let old_summary = old_stats.as_ref().map(|stats| stats.summarize());
+    for (name, _func) in benches.iter() {
+        let stats = match stats_map.get(*name) {
+            Some(s) => s,
+            None => {
+                eprintln!("No results found for benchmark '{}'", name);
+                continue;
+            }
+        };
+        let old_stats = old_stats_map.get(*name);
+
+        let old_summary = old_stats.map(|s| s.summarize());
         let summary = stats.summarize();
-        for line in format_benchmark_report(
-            name,
-            &stats,
-            old_stats.as_ref(),
-            &summary,
-            old_summary.as_ref(),
-        ) {
+        for line in format_benchmark_report(name, stats, old_stats, &summary, old_summary.as_ref())
+        {
             println!("{}", line);
         }
     }
@@ -117,12 +94,11 @@ where
 /// process execution and to make output formatting test-friendly.
 fn format_benchmark_report(
     name: &str,
-    stats: &CachegrindStats,
-    old_stats: Option<&CachegrindStats>,
-    summary: &CachegrindSummary,
-    old_summary: Option<&CachegrindSummary>,
+    stats: &CallgrindStats,
+    old_stats: Option<&CallgrindStats>,
+    summary: &CallgrindSummary,
+    old_summary: Option<&CallgrindSummary>,
 ) -> Vec<String> {
-    // Build lines only; keep I/O out of the runner core for easier testing.
     let mut lines = Vec::with_capacity(6);
     lines.push(name.to_owned());
     lines.push(format!(
@@ -169,47 +145,24 @@ fn format_benchmark_report(
     lines
 }
 
-/// Execute a single benchmark when invoked in child mode.
+/// Execute all benchmarks when invoked in child mode.
 ///
-/// Returns `true` if a benchmark was dispatched, `false` otherwise.
-/// Returns `true` when the selected benchmark was dispatched.
-/// This path is only used for `--iai-run N` re-entry via `valgrind`.
-fn run_child_benchmark(benches: &[&(&'static str, fn())], benchmark_index: isize) -> bool {
-    if benchmark_index < 0 {
-        // Keep behavior defensive and deterministic for malformed invocations.
-        return false;
-    }
-
-    match usize::try_from(benchmark_index) {
-        Err(_) => {
-            eprintln!("Invalid benchmark index: {}", benchmark_index);
-            false
-        }
-        Ok(index) => {
-            if index >= benches.len() {
-                eprintln!(
-                    "Invalid benchmark index: {}. This index is out of range.",
-                    index
-                );
-                return false;
-            }
-
-            (benches[index].1)();
-            true
-        }
+/// This path is used for `--iai-run` re-entry via Callgrind. All benchmarks
+/// run sequentially; Callgrind's `--toggle-collect` isolates per-function counters.
+fn run_child_benchmarks(benches: &[&(&'static str, fn())]) {
+    for (_name, func) in benches.iter() {
+        func();
     }
 }
 
 /// Probe `valgrind` readiness before running parent-mode benchmarks.
 ///
-/// Returns `true` only when `valgrind --tool=cachegrind --version` exits
+/// Returns `true` only when `valgrind --tool=callgrind --version` exits
 /// successfully; otherwise prints a diagnostic and returns `false`.
 fn check_valgrind(system: &impl System) -> bool {
-    // Call `valgrind --tool=cachegrind --version` with suppressed output to avoid
-    // polluting benchmark output before actual runs.
     let mut command = Command::new("valgrind");
     command
-        .arg("--tool=cachegrind")
+        .arg("--tool=callgrind")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -232,12 +185,10 @@ fn check_valgrind(system: &impl System) -> bool {
 
 /// Resolve target architecture identifier without invoking external commands.
 fn get_arch() -> String {
-    // Prefer the compiler-reported target architecture instead of shelling out.
     std::env::consts::ARCH.to_owned()
 }
 
 /// Construct the base command for a normal `valgrind` invocation.
-/// This intentionally omits ASLR wrappers and keeps command-shape concerns local.
 fn basic_valgrind() -> Command {
     Command::new("valgrind")
 }
@@ -245,7 +196,6 @@ fn basic_valgrind() -> Command {
 #[cfg(target_os = "linux")]
 /// Linux disables ASLR via `setarch` when requested.
 fn valgrind_without_aslr(arch: &str) -> Command {
-    // Keep path selection centralized so testability and OS-specific behavior are explicit.
     let mut command = Command::new("setarch");
     command.arg(arch).arg("-R").arg("valgrind");
     command
@@ -254,8 +204,6 @@ fn valgrind_without_aslr(arch: &str) -> Command {
 #[cfg(target_os = "freebsd")]
 /// FreeBSD disables ASLR via `proccontrol` when requested.
 fn valgrind_without_aslr(_arch: &str) -> Command {
-    // Keep the disablement helper explicit to avoid silently skipping the ASLR
-    // behavior on supported BSD hosts.
     let mut command = Command::new("proccontrol");
     command.arg("-m").arg("aslr").arg("-s").arg("disable");
     command
@@ -264,24 +212,22 @@ fn valgrind_without_aslr(_arch: &str) -> Command {
 #[cfg(all(not(target_os = "linux"), not(target_os = "freebsd")))]
 /// Fallback command when no platform-specific ASLR wrapper exists.
 fn valgrind_without_aslr(_arch: &str) -> Command {
-    // Fallback path for platforms without a dedicated ASLR wrapper command.
     basic_valgrind()
 }
 
-/// Execute one benchmark invocation and parse current and optional prior cachegrind output.
-fn run_bench(
+/// Execute all benchmarks in a single Callgrind invocation and parse results.
+///
+/// Returns a tuple of (current stats, old baseline stats) as HashMaps keyed
+/// by benchmark name. The old stats map is empty if no prior baseline exists.
+fn run_benches(
     system: &impl System,
     arch: &str,
     executable: &str,
-    index: isize,
-    benchmark_name: &str,
+    benches: &[&(&'static str, fn())],
     allow_aslr: bool,
-) -> Result<(CachegrindStats, Option<CachegrindStats>), RunnerError> {
-    // Output path is fixed under target/iai so multiple invocations can rotate and
-    // compare against a prior snapshot.
-    let output_file = PathBuf::from(format!("target/iai/cachegrind.out.{benchmark_name}"));
-    let old_output_file =
-        output_file.with_file_name(format!("cachegrind.out.{benchmark_name}.old"));
+) -> Result<(BenchStatsMap, BenchStatsMap), RunnerError> {
+    let output_file = PathBuf::from("target/iai/callgrind.out");
+    let old_output_file = output_file.with_file_name("callgrind.out.old");
 
     let output_dir = output_file
         .parent()
@@ -302,15 +248,23 @@ fn run_bench(
     };
 
     command
-        .arg("--tool=cachegrind")
+        .arg("--tool=callgrind")
         .arg("--cache-sim=yes")
         .arg("--I1=32768,8,64")
         .arg("--D1=32768,8,64")
         .arg("--LL=8388608,16,64")
-        .arg(format!("--cachegrind-out-file={}", output_file.display()))
+        .arg(format!("--callgrind-out-file={}", output_file.display()))
+        .arg("--compress-strings=no")
+        .arg("--compress-pos=no")
+        .arg("--collect-atstart=no");
+
+    for (name, _func) in benches.iter() {
+        command.arg(format!("--toggle-collect=__iai_bench_{name}"));
+    }
+
+    command
         .arg(executable)
         .arg("--iai-run")
-        .arg(index.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
@@ -319,35 +273,39 @@ fn run_bench(
         return Err(RunnerError::CommandFailed(status));
     }
 
-    let new_stats = parse_cachegrind_output(system, &output_file)?;
+    let new_stats = parse_callgrind_output(system, &output_file)?;
     let old_stats = if system.file_exists(&old_output_file) {
-        Some(parse_cachegrind_output(system, &old_output_file)?)
+        parse_callgrind_output(system, &old_output_file)?
     } else {
-        None
+        HashMap::new()
     };
 
     Ok((new_stats, old_stats))
 }
 
-/// Parse Cachegrind output from `path` into typed benchmark counters.
+/// Parse Callgrind output from `path` into per-benchmark typed counters.
 ///
-/// The parser requires matching `events:` and `summary:` records and all mandatory
-/// event counters required by `CachegrindStats::from_events`.
-/// It:
-/// - captures event names and tokenized summary values from the relevant lines
-/// - enforces same token count for both lines
-/// - fails fast with contextual `RunnerError::ParseError` on malformed data
-fn parse_cachegrind_output(
+/// The parser scans for:
+/// - An `events:` line defining the event names
+/// - `cfn=__iai_bench_<name>` lines identifying benchmark function sections
+/// - For each such section, reads the `calls=` line and the inclusive-cost data line
+///
+/// Callgrind format notes:
+/// - Trailing zero values on data lines are omitted; missing positions default to 0.
+/// - The data line format is `<position> <values...>` where position is skipped.
+///
+/// Returns a HashMap mapping benchmark names to their CallgrindStats.
+fn parse_callgrind_output(
     system: &impl System,
     path: &Path,
-) -> Result<CachegrindStats, RunnerError> {
-    // Parse side-effect-free and line-oriented so callers can depend on stable,
-    // deterministic errors for file shape drift.
+) -> Result<HashMap<String, CallgrindStats>, RunnerError> {
     let file = system.open_file(path).map_err(RunnerError::Io)?;
-    let mut events_tokens = None;
-    let mut summary_tokens = None;
+    let mut events_tokens: Option<Vec<String>> = None;
+    let mut results = HashMap::new();
 
-    for line in BufReader::new(file).lines() {
+    let mut lines = BufReader::new(file).lines();
+
+    while let Some(line) = lines.next() {
         let line = line.map_err(RunnerError::Io)?;
 
         if let Some(values) = line.strip_prefix("events: ") {
@@ -360,59 +318,80 @@ fn parse_cachegrind_output(
             continue;
         }
 
-        if let Some(values) = line.strip_prefix("summary: ") {
-            summary_tokens = Some(
-                values
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>(),
-            );
+        if let Some(name) = line.strip_prefix("cfn=__iai_bench_") {
+            let events = events_tokens.as_ref().ok_or_else(|| {
+                RunnerError::ParseError(format!(
+                    "Unable to parse callgrind output file {}: events line must appear before function data",
+                    path.display(),
+                ))
+            })?;
+
+            // Skip the calls line
+            let _calls = lines.next().ok_or_else(|| {
+                RunnerError::ParseError(format!(
+                    "Unable to parse callgrind output file {}: unexpected end of file after cfn=__iai_bench_{}",
+                    path.display(),
+                    name,
+                ))
+            })?.map_err(RunnerError::Io)?;
+
+            // Read the data line: "<position> <values...>"
+            let data_line = lines.next().ok_or_else(|| {
+                RunnerError::ParseError(format!(
+                    "Unable to parse callgrind output file {}: unexpected end of file after calls line for {}",
+                    path.display(),
+                    name,
+                ))
+            })?.map_err(RunnerError::Io)?;
+
+            let event_map = parse_data_line(events, &data_line, path)?;
+
+            let stats = CallgrindStats::from_events(&event_map).map_err(RunnerError::ParseError)?;
+            results.insert(name.to_owned(), stats);
         }
     }
 
-    let events_tokens = events_tokens.ok_or_else(|| {
-        RunnerError::ParseError(format!(
-            "Unable to parse cachegrind output file {}: missing events line",
-            path.display(),
-        ))
-    })?;
+    Ok(results)
+}
 
-    let summary_tokens = summary_tokens.ok_or_else(|| {
-        RunnerError::ParseError(format!(
-            "Unable to parse cachegrind output file {}: missing summary line",
-            path.display(),
-        ))
-    })?;
+/// Parse a single Callgrind data line into an event-value map.
+///
+/// The line format is `<position> <value>...` where the first token is a source
+/// position (skipped) and subsequent tokens map positionally to the events list.
+/// Callgrind omits trailing zero values, so any events beyond the provided values
+/// default to 0.
+fn parse_data_line(
+    events: &[String],
+    data_line: &str,
+    path: &Path,
+) -> Result<HashMap<String, u64>, RunnerError> {
+    let mut tokens = data_line.split_whitespace();
+    let _position = tokens.next(); // skip source position
 
-    let mut events: HashMap<String, u64> = HashMap::with_capacity(events_tokens.len());
-
-    if events_tokens.len() != summary_tokens.len() {
-        return Err(RunnerError::ParseError(format!(
-            "Unable to parse cachegrind output file {}: events and summary lengths do not match",
-            path.display(),
-        )));
+    let mut event_map: HashMap<String, u64> = HashMap::with_capacity(events.len());
+    for event_name in events {
+        let value = match tokens.next() {
+            Some(value_str) => value_str.parse::<u64>().map_err(|error| {
+                RunnerError::ParseError(format!(
+                    "Unable to parse callgrind output file {}: value '{}' for event '{}' is invalid ({})",
+                    path.display(),
+                    value_str,
+                    event_name,
+                    error,
+                ))
+            })?,
+            // Callgrind omits trailing zeros on data lines.
+            None => 0,
+        };
+        event_map.insert(event_name.clone(), value);
     }
 
-    for (event, value) in events_tokens.into_iter().zip(summary_tokens.into_iter()) {
-        let value = value.parse::<u64>().map_err(|error| {
-            RunnerError::ParseError(format!(
-                "Unable to parse cachegrind output file {}: value '{}' for event '{}' is invalid ({})",
-                path.display(),
-                value,
-                event,
-                error
-            ))
-        })?;
-
-        events.insert(event.to_owned(), value);
-    }
-
-    CachegrindStats::from_events(&events).map_err(RunnerError::ParseError)
+    Ok(event_map)
 }
 
 /// Internal runner execution errors.
 ///
-/// These cover I/O boundaries, command failures, and cachegrind parse failures.
+/// These cover I/O boundaries, command failures, and callgrind parse failures.
 #[derive(Debug)]
 enum RunnerError {
     /// Error while creating directories, copying files, or reading outputs.
@@ -456,12 +435,12 @@ mod tests {
     /// Process-local call counters used by helper benchmarks to assert dispatch.
     static BENCH_TWO_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    /// Benchmark stub for index-selection tests.
+    /// Benchmark stub for dispatch tests.
     fn bench_one() {
         BENCH_ONE_CALLS.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Benchmark stub for index-selection tests.
+    /// Benchmark stub for dispatch tests.
     fn bench_two() {
         BENCH_TWO_CALLS.fetch_add(1, Ordering::SeqCst);
     }
@@ -482,98 +461,101 @@ mod tests {
         BENCH_TWO_CALLS.load(Ordering::SeqCst)
     }
 
-    /// Create a temporary Cachegrind-style output fixture and return its path.
-    ///
-    /// The file is given a unique name per test process and monotonic id to
-    /// avoid collisions across test invocations.
+    /// Create a temporary Callgrind-style output fixture and return its path.
     fn with_tmp_file(contents: &str) -> PathBuf {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "iai-cachegrind-test-{}-{}.out",
+            "iai-callgrind-test-{}-{}.out",
             std::process::id(),
             id
         ));
-        fs::write(&path, contents).expect("failed to write temporary cachegrind output");
+        fs::write(&path, contents).expect("failed to write temporary callgrind output");
         path
     }
 
-    /// Parse cachegrind output from a temp path and remove the fixture afterward.
-    ///
-    /// Cleanup is performed regardless of parse outcome to keep tests independent
-    /// and avoid leaking per-run artifacts into shared temp directories.
-    fn read_and_cleanup(path: PathBuf) -> Result<CachegrindStats, RunnerError> {
+    /// Parse callgrind output from a temp path and remove the fixture afterward.
+    fn read_and_cleanup(path: PathBuf) -> Result<BenchStatsMap, RunnerError> {
         let result = {
             let system = StandardSystem::new();
-            parse_cachegrind_output(&system, &path)
+            parse_callgrind_output(&system, &path)
         };
         let _ = fs::remove_file(path);
         result
     }
 
     #[test]
-    fn parse_cachegrind_output_parses_valid_output() {
+    fn parse_callgrind_output_parses_valid_output() {
         let path = with_tmp_file(
-            "events: Ir I1mr ILmr Dr D1mr DLmr Dw D1mw DLmw\nsummary: 10 1 2 3 4 5 6 7 8\n",
+            "events: Ir I1mr ILmr Dr D1mr DLmr Dw D1mw DLmw\n\
+             cfn=__iai_bench_my_bench\n\
+             calls=1 0\n\
+             0 10 1 2 3 4 5 6 7 8\n",
         );
 
-        let parsed = read_and_cleanup(path).expect("expected cachegrind output to parse");
+        let parsed = read_and_cleanup(path).expect("expected callgrind output to parse");
+        let stats = parsed
+            .get("my_bench")
+            .expect("expected my_bench in results");
 
-        assert_eq!(parsed.instruction_reads, 10);
-        assert_eq!(parsed.instruction_l1_misses, 1);
-        assert_eq!(parsed.instruction_cache_misses, 2);
-        assert_eq!(parsed.data_reads, 3);
-        assert_eq!(parsed.data_l1_read_misses, 4);
-        assert_eq!(parsed.data_cache_read_misses, 5);
-        assert_eq!(parsed.data_writes, 6);
-        assert_eq!(parsed.data_l1_write_misses, 7);
-        assert_eq!(parsed.data_cache_write_misses, 8);
+        assert_eq!(stats.instruction_reads, 10);
+        assert_eq!(stats.instruction_l1_misses, 1);
+        assert_eq!(stats.instruction_cache_misses, 2);
+        assert_eq!(stats.data_reads, 3);
+        assert_eq!(stats.data_l1_read_misses, 4);
+        assert_eq!(stats.data_cache_read_misses, 5);
+        assert_eq!(stats.data_writes, 6);
+        assert_eq!(stats.data_l1_write_misses, 7);
+        assert_eq!(stats.data_cache_write_misses, 8);
     }
 
     #[test]
-    fn parse_cachegrind_output_missing_events_line() {
-        let path = with_tmp_file("summary: 10 1 2 3 4 5 6 7 8\n");
-
-        let parsed = read_and_cleanup(path).expect_err("expected parse failure");
-        let message = match parsed {
-            RunnerError::ParseError(message) => message,
-            _ => panic!("expected parse error"),
-        };
-
-        assert!(message.contains("missing events line"));
-    }
-
-    #[test]
-    fn parse_cachegrind_output_missing_summary_line() {
-        let path = with_tmp_file("events: Ir I1mr ILmr Dr D1mr DLmr Dw D1mw DLmw\n");
-
-        let parsed = read_and_cleanup(path).expect_err("expected parse failure");
-        let message = match parsed {
-            RunnerError::ParseError(message) => message,
-            _ => panic!("expected parse error"),
-        };
-
-        assert!(message.contains("missing summary line"));
-    }
-
-    #[test]
-    fn parse_cachegrind_output_requires_matching_token_lengths() {
-        let path = with_tmp_file("events: Ir I1mr ILmr\nsummary: 10 1 2 3\n");
-
-        let parsed = read_and_cleanup(path).expect_err("expected parse failure");
-        let message = match parsed {
-            RunnerError::ParseError(message) => message,
-            _ => panic!("expected parse error"),
-        };
-
-        assert!(message.contains("events and summary lengths do not match"));
-    }
-
-    #[test]
-    fn parse_cachegrind_output_rejects_non_numeric_data() {
+    fn parse_callgrind_output_parses_multiple_benchmarks() {
         let path = with_tmp_file(
-            "events: Ir I1mr ILmr Dr D1mr DLmr Dw D1mw DLmw\nsummary: 10 1 a 3 4 5 6 7 8\n",
+            "events: Ir I1mr ILmr Dr D1mr DLmr Dw D1mw DLmw\n\
+             cfn=__iai_bench_bench_a\n\
+             calls=1 0\n\
+             0 10 1 2 3 4 5 6 7 8\n\
+             cfn=__iai_bench_bench_b\n\
+             calls=1 0\n\
+             0 20 2 4 6 8 10 12 14 16\n",
+        );
+
+        let parsed = read_and_cleanup(path).expect("expected callgrind output to parse");
+        assert_eq!(parsed.len(), 2);
+
+        let a = parsed.get("bench_a").expect("expected bench_a");
+        assert_eq!(a.instruction_reads, 10);
+
+        let b = parsed.get("bench_b").expect("expected bench_b");
+        assert_eq!(b.instruction_reads, 20);
+    }
+
+    #[test]
+    fn parse_callgrind_output_missing_events_line() {
+        let path = with_tmp_file(
+            "cfn=__iai_bench_my_bench\n\
+             calls=1 0\n\
+             0 10 1 2 3 4 5 6 7 8\n",
+        );
+
+        let parsed = read_and_cleanup(path).expect_err("expected parse failure");
+        let message = match parsed {
+            RunnerError::ParseError(message) => message,
+            _ => panic!("expected parse error"),
+        };
+
+        assert!(message.contains("events line must appear before function data"));
+    }
+
+    #[test]
+    fn parse_callgrind_output_rejects_non_numeric_data() {
+        let path = with_tmp_file(
+            "events: Ir I1mr ILmr Dr D1mr DLmr Dw D1mw DLmw\n\
+             cfn=__iai_bench_my_bench\n\
+             calls=1 0\n\
+             0 10 1 a 3 4 5 6 7 8\n",
         );
 
         let parsed = read_and_cleanup(path).expect_err("expected parse failure");
@@ -586,7 +568,42 @@ mod tests {
     }
 
     #[test]
-    fn runner_child_mode_dispatches_only_selected_benchmark() {
+    fn parse_callgrind_output_handles_trailing_zeros_omitted() {
+        // Callgrind omits trailing zero values on data lines.
+        let path = with_tmp_file(
+            "events: Ir I1mr ILmr Dr D1mr DLmr Dw D1mw DLmw\n\
+             cfn=__iai_bench_my_bench\n\
+             calls=1 0\n\
+             0 42 3 1\n",
+        );
+
+        let parsed = read_and_cleanup(path).expect("expected callgrind output to parse");
+        let stats = parsed
+            .get("my_bench")
+            .expect("expected my_bench in results");
+
+        assert_eq!(stats.instruction_reads, 42);
+        assert_eq!(stats.instruction_l1_misses, 3);
+        assert_eq!(stats.instruction_cache_misses, 1);
+        // Remaining events default to 0
+        assert_eq!(stats.data_reads, 0);
+        assert_eq!(stats.data_l1_read_misses, 0);
+        assert_eq!(stats.data_cache_read_misses, 0);
+        assert_eq!(stats.data_writes, 0);
+        assert_eq!(stats.data_l1_write_misses, 0);
+        assert_eq!(stats.data_cache_write_misses, 0);
+    }
+
+    #[test]
+    fn parse_callgrind_output_returns_empty_for_no_benchmarks() {
+        let path = with_tmp_file("events: Ir I1mr ILmr Dr D1mr DLmr Dw D1mw DLmw\n");
+
+        let parsed = read_and_cleanup(path).expect("expected callgrind output to parse");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn runner_child_mode_dispatches_all_benchmarks() {
         reset_bench_counts();
         let benches: &[&(&str, fn())] = &[&("bench_one", bench_one), &("bench_two", bench_two)];
         let system = FakeSystem::default();
@@ -594,14 +611,10 @@ mod tests {
         run_with_system(
             benches,
             &system,
-            vec![
-                "iai-binary".to_owned(),
-                "--iai-run".to_owned(),
-                "1".to_owned(),
-            ],
+            vec!["iai-binary".to_owned(), "--iai-run".to_owned()],
         );
 
-        assert_eq!(bench_one_calls(), 0);
+        assert_eq!(bench_one_calls(), 1);
         assert_eq!(bench_two_calls(), 1);
         assert_eq!(system.output_calls.get(), 0);
     }
@@ -644,7 +657,7 @@ mod tests {
             Ok(0)
         }
 
-        /// The fake reports no cachegrind outputs to force parent-mode early failure paths.
+        /// The fake reports no callgrind outputs to force parent-mode early failure paths.
         fn file_exists(&self, _path: &Path) -> bool {
             false
         }
@@ -661,7 +674,7 @@ mod tests {
             Err(io::Error::other("not used in this test"))
         }
 
-        /// Count every output probe to assert the runner’s parent-mode readiness check behavior.
+        /// Count every output probe to assert the runner's parent-mode readiness check behavior.
         fn output(&self, _command: &mut Command) -> io::Result<Output> {
             self.output_calls.set(self.output_calls.get() + 1);
             Err(io::Error::new(
