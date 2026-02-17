@@ -8,7 +8,6 @@ fn fibonacci(n: u64) -> u64 {
 }
 
 fn bench_empty() {
-    return;
 }
 
 fn bench_fibonacci() -> u64 {

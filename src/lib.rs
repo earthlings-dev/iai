@@ -58,7 +58,10 @@ fn check_valgrind() -> bool {
             if status.success() {
                 true
             } else {
-                println!("Failed to launch valgrind. Error: {}. Please ensure that valgrind is installed and on the $PATH.", status);
+                println!(
+                    "Failed to launch valgrind. Error: {}. Please ensure that valgrind is installed and on the $PATH.",
+                    status
+                );
                 false
             }
         }
