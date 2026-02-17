@@ -1,13 +1,19 @@
-//! Public crate façade for IAI runner and optional benchmark macro re-export.
+//! Experimental one-shot benchmarking framework using Valgrind cache simulation.
 //!
-//! The crate keeps runtime behavior split across:
-//! - Domain types/functions (`src/domain.rs`)
-//! - Application orchestration (`src/application.rs`)
-//! - Port traits (`src/ports.rs`)
-//! - Infrastructure adapters (`src/infrastructure.rs`)
+//! By default Iai uses **Cachegrind**. Enable the `callgrind` feature for
+//! Callgrind support, or enable both features to run both tools side-by-side.
 //!
-//! This top-level module only wires modules together and preserves the existing
-//! public API.
+//! ## Feature flags
+//!
+//! | Feature | Default | Description |
+//! |---|---|---|
+//! | `cachegrind` | yes | Cachegrind profiling backend |
+//! | `callgrind` | no | Callgrind profiling backend |
+//! | `macro` | no | Procedural macro support (`#[iai]`) |
+//! | `real_blackbox` | no | Use nightly `test::black_box` intrinsic |
+//!
+//! When both `cachegrind` and `callgrind` are enabled, results are grouped by
+//! tool. Set `IAI_GROUP_BY_BENCHMARK=1` to group by benchmark instead.
 
 #[cfg(feature = "macro")]
 pub use iai_macro::iai;

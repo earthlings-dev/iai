@@ -1,11 +1,14 @@
 [package]
 name = "iai_macro"
-version = "0.1.1"
-authors = ["Brook Heisler <redattack34@gmail.com>"]
+version = "0.2.0"
+authors = [
+    "Brook Heisler <redattack34@gmail.com>",
+    "takumi.earth <165885386+takumi-earth@users.noreply.github.com>",
+]
 edition = "2018"
 
 description = "Custom Test Framework macro for Iai"
-repository = "https://github.com/bheisler/iai"
+repository = "https://github.com/earthlings-dev/iai"
 readme = "README.md"
 keywords = ["iai", "benchmark", "macro"]
 categories = ["development-tools::profiling"]
@@ -20,7 +23,7 @@ quote = "1.0"
 syn = { version = "2", features = ["full"] }
 
 [dev-dependencies]
-iai = { version = "0.1.1", path = "..", default-features = false, features = ["macro"] }
+iai = { version = "0.2.0", path = "..", default-features = false, features = ["macro"] }
 
 [[bench]]
 name = "test_macro_bench"

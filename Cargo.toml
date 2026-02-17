@@ -1,22 +1,27 @@
 [package]
 name = "iai"
-version = "0.1.1"
-authors = ["Brook Heisler <redattack34@gmail.com>"]
+version = "0.2.0"
+authors = [
+    "Brook Heisler <redattack34@gmail.com>",
+    "takumi.earth <165885386+takumi-earth@users.noreply.github.com>",
+]
 edition = "2024"
 description = "One-shot benchmarking library"
-repository = "https://github.com/bheisler/iai"
+repository = "https://github.com/earthlings-dev/iai"
 readme = "README.md"
 keywords = ["iai", "benchmark"]
 categories = ["development-tools::profiling"]
 license = "Apache-2.0/MIT"
 
 [dependencies]
-iai_macro = { version = "0.1.0", path = "macro", optional = true }
+iai_macro = { version = "0.2.0", path = "macro", optional = true }
 
 [features]
 real_blackbox = []
 macro = ["iai_macro"]
-default = []
+cachegrind = []
+callgrind = []
+default = ["cachegrind"]
 
 [[bench]]
 name = "test_regular_bench"

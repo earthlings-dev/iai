@@ -13,11 +13,13 @@ pub(crate) struct Invocation {
     pub(crate) mode: InvocationMode,
 }
 
-/// The two invocation modes recognized by the runner.
+/// The invocation modes recognized by the runner.
 #[derive(Clone, Debug)]
 pub(crate) enum InvocationMode {
-    /// Spawned child invocation; runs all benchmarks under Callgrind collection.
+    /// Callgrind child: run all benchmarks sequentially under `--toggle-collect`.
     Child,
+    /// Cachegrind child: run a single benchmark by index via `--iai-run <N>`.
+    ChildIndexed { benchmark_index: isize },
     /// Primary harness invocation; drives all registered benches.
     Parent,
 }
@@ -26,7 +28,8 @@ pub(crate) enum InvocationMode {
 ///
 /// Expected shape:
 /// - No special flags => parent mode
-/// - `--iai-run` => child mode (all benchmarks run under Callgrind)
+/// - `--iai-run` (no further arg) => callgrind child mode (all benchmarks)
+/// - `--iai-run <N>` => cachegrind child mode (single benchmark by index)
 pub(crate) fn parse_invocation<I>(mut args: I) -> Invocation
 where
     I: Iterator<Item = String>,
@@ -34,9 +37,18 @@ where
     let executable = args.next().unwrap_or_default();
 
     match args.next() {
-        Some(flag) if flag == "--iai-run" => Invocation {
-            executable,
-            mode: InvocationMode::Child,
+        Some(flag) if flag == "--iai-run" => match args.next() {
+            Some(index_str) => {
+                let benchmark_index = index_str.parse::<isize>().unwrap_or(-1);
+                Invocation {
+                    executable,
+                    mode: InvocationMode::ChildIndexed { benchmark_index },
+                }
+            }
+            None => Invocation {
+                executable,
+                mode: InvocationMode::Child,
+            },
         },
         _ => Invocation {
             executable,
@@ -46,23 +58,23 @@ where
 }
 
 impl fmt::Display for Invocation {
-    /// Display either `"<exe>"` or `"<exe> --iai-run"`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.mode {
             InvocationMode::Parent => write!(f, "{}", self.executable),
-            InvocationMode::Child => {
-                write!(f, "{} --iai-run", self.executable)
+            InvocationMode::Child => write!(f, "{} --iai-run", self.executable),
+            InvocationMode::ChildIndexed { benchmark_index } => {
+                write!(f, "{} --iai-run {}", self.executable, benchmark_index)
             }
         }
     }
 }
 
-/// Callgrind counters required by the parser and reporting pipeline.
+/// Valgrind cache-simulation counters shared by both cachegrind and callgrind.
 ///
-/// The fields map directly to the events requested from Callgrind and are kept
-/// as raw counters until report-time normalization.
+/// Both tools emit the same 9 events (Ir, I1mr, ILmr, Dr, D1mr, DLmr, Dw, D1mw,
+/// DLmw) so a single struct serves both profiling backends.
 #[derive(Clone, Debug)]
-pub(crate) struct CallgrindStats {
+pub(crate) struct BenchStats {
     pub(crate) instruction_reads: u64,
     pub(crate) instruction_l1_misses: u64,
     pub(crate) instruction_cache_misses: u64,
@@ -74,8 +86,8 @@ pub(crate) struct CallgrindStats {
     pub(crate) data_cache_write_misses: u64,
 }
 
-impl CallgrindStats {
-    /// Build stats from parsed Callgrind event values.
+impl BenchStats {
+    /// Build stats from parsed event values.
     ///
     /// Returns an error if any required event is missing.
     pub(crate) fn from_events(events: &HashMap<String, u64>) -> Result<Self, String> {
@@ -106,14 +118,12 @@ impl CallgrindStats {
     }
 
     /// RAM-level memory accesses derived from event counters.
-    ///
-    /// This is the sum of instruction/data LLC misses and write misses.
     pub(crate) fn ram_accesses(&self) -> u64 {
         self.instruction_cache_misses + self.data_cache_read_misses + self.data_cache_write_misses
     }
 
     /// Reduce raw counters into cache hierarchy groupings used by reports.
-    pub(crate) fn summarize(&self) -> CallgrindSummary {
+    pub(crate) fn summarize(&self) -> BenchSummary {
         let ram_hits = self.ram_accesses();
         let l3_accesses =
             self.instruction_l1_misses + self.data_l1_read_misses + self.data_l1_write_misses;
@@ -122,27 +132,56 @@ impl CallgrindStats {
         let total_memory_rw = self.instruction_reads + self.data_reads + self.data_writes;
         let l1_hits = total_memory_rw - (ram_hits + l3_hits);
 
-        CallgrindSummary {
+        BenchSummary {
             l1_hits,
             l3_hits,
             ram_hits,
+        }
+    }
+
+    /// Subtract calibration counters with saturating arithmetic.
+    ///
+    /// Used by the cachegrind backend to remove harness overhead from results.
+    #[cfg(feature = "cachegrind")]
+    pub(crate) fn subtract(&self, calibration: &BenchStats) -> BenchStats {
+        BenchStats {
+            instruction_reads: self
+                .instruction_reads
+                .saturating_sub(calibration.instruction_reads),
+            instruction_l1_misses: self
+                .instruction_l1_misses
+                .saturating_sub(calibration.instruction_l1_misses),
+            instruction_cache_misses: self
+                .instruction_cache_misses
+                .saturating_sub(calibration.instruction_cache_misses),
+            data_reads: self.data_reads.saturating_sub(calibration.data_reads),
+            data_l1_read_misses: self
+                .data_l1_read_misses
+                .saturating_sub(calibration.data_l1_read_misses),
+            data_cache_read_misses: self
+                .data_cache_read_misses
+                .saturating_sub(calibration.data_cache_read_misses),
+            data_writes: self.data_writes.saturating_sub(calibration.data_writes),
+            data_l1_write_misses: self
+                .data_l1_write_misses
+                .saturating_sub(calibration.data_l1_write_misses),
+            data_cache_write_misses: self
+                .data_cache_write_misses
+                .saturating_sub(calibration.data_cache_write_misses),
         }
     }
 }
 
 /// Derived cache summary values used for presentation.
 #[derive(Clone, Debug)]
-pub(crate) struct CallgrindSummary {
+pub(crate) struct BenchSummary {
     pub(crate) l1_hits: u64,
     pub(crate) l3_hits: u64,
     pub(crate) ram_hits: u64,
 }
 
-impl CallgrindSummary {
+impl BenchSummary {
     /// Estimate weighted memory-hierarchy cycles.
-    ///
-    /// The weighting intentionally follows a simple static model used by this
-    /// project and is kept in one place to support later replacement.
     pub(crate) fn cycles(&self) -> u64 {
         // Uses Itamar Turner-Trauring's formula from https://pythonspeed.com/articles/consistent-benchmarking-in-ci/
         self.l1_hits + (5 * self.l3_hits) + (35 * self.ram_hits)
@@ -202,11 +241,43 @@ mod tests {
     }
 
     #[test]
-    fn parse_invocation_child_mode() {
+    fn parse_invocation_child_mode_no_index() {
         let args = vec!["/path/to/test".to_owned(), "--iai-run".to_owned()];
         let invocation = parse_invocation(args.into_iter());
 
         assert!(matches!(invocation.mode, InvocationMode::Child));
+    }
+
+    #[test]
+    fn parse_invocation_child_indexed_mode() {
+        let args = vec![
+            "/path/to/test".to_owned(),
+            "--iai-run".to_owned(),
+            "2".to_owned(),
+        ];
+        let invocation = parse_invocation(args.into_iter());
+
+        assert!(matches!(
+            invocation.mode,
+            InvocationMode::ChildIndexed { benchmark_index: 2 }
+        ));
+    }
+
+    #[test]
+    fn parse_invocation_child_indexed_non_numeric_defaults_to_negative() {
+        let args = vec![
+            "/path/to/test".to_owned(),
+            "--iai-run".to_owned(),
+            "not-a-number".to_owned(),
+        ];
+        let invocation = parse_invocation(args.into_iter());
+
+        assert!(matches!(
+            invocation.mode,
+            InvocationMode::ChildIndexed {
+                benchmark_index: -1
+            }
+        ));
     }
 
     #[test]
@@ -230,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn callgrind_from_events_requires_all_metrics() {
+    fn bench_stats_from_events_requires_all_metrics() {
         let events = vec![
             ("Ir".to_owned(), 1),
             ("I1mr".to_owned(), 2),
@@ -244,6 +315,6 @@ mod tests {
         .into_iter()
         .collect::<std::collections::HashMap<String, u64>>();
 
-        assert!(CallgrindStats::from_events(&events).is_err());
+        assert!(BenchStats::from_events(&events).is_err());
     }
 }
